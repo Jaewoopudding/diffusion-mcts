@@ -1,4 +1,4 @@
-from sd_pipeline import DPS_continuous_SDPipeline, Decoding_nonbatch_SDPipeline
+from sd_pipeline import Decoding_MCTS
 from diffusers import DDIMScheduler
 import torch
 import numpy as np
@@ -23,8 +23,10 @@ def parse():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--reward", type=str, default='aesthetic')
     parser.add_argument("--out_dir", type=str, default="")
-    parser.add_argument("--num_images", type=int, default=5)
-    parser.add_argument("--bs", type=int, default=5)
+    parser.add_argument("--num_images", type=int, default=4)
+    parser.add_argument("--bs", type=int, default=2)
+    parser.add_argument("--nfe_per_action", type=int, default=2)
+    parser.add_argument("--expansion_coef", type=float, default=0.2)
     parser.add_argument("--val_bs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--duplicate_size",type=int, default=20)  
@@ -40,17 +42,7 @@ args = parse()
 device= args.device
 save_file = True
 
-## Image Seeds
-if args.seed > 0:
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    shape = (args.num_images//args.bs, args.bs , 4, 64, 64)
-    init_latents = torch.randn(shape, device=device)
-else:
-    init_latents = None
-
-run_name = f"{args.variant}_M={args.duplicate_size}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
+run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
 unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
 run_name = run_name + '_' + unique_id
 
@@ -63,14 +55,14 @@ except:
     pass
 
 
-wandb.init(project=f"SVDD-{args.reward}", name=run_name,config=args)
+wandb.init(project=f"MCTS-{args.reward}", name=run_name,config=args)
 
 start_event = torch.cuda.Event(enable_timing=True)
 end_event = torch.cuda.Event(enable_timing=True)
 start_event.record()
 initial_memory = torch.cuda.memory_allocated()
 
-sd_model = Decoding_nonbatch_SDPipeline.from_pretrained("runwayml/stable-diffusion-v1-5", local_files_only=True)
+sd_model = Decoding_MCTS.from_pretrained("runwayml/stable-diffusion-v1-5", local_files_only=True)
 sd_model.to(device)
 
 # switch to DDIM scheduler
@@ -110,6 +102,9 @@ sd_model.setup_scorer(scorer)
 sd_model.set_variant(args.variant)
 sd_model.set_reward(args.reward)
 sd_model.set_parameters(args.bs, args.duplicate_size)
+sd_model.set_nfe_per_action(args.nfe_per_action)
+sd_model.set_expansion_coef(args.expansion_coef)
+
 
 ### introducing evaluation prompts
 import prompts as prompts_file
@@ -120,10 +115,21 @@ image = []
 eval_prompt_list = []
 KL_list = []
 
-for i in tqdm(range(args.num_images // args.bs), desc="Generating Images"):
+for i in tqdm(range(args.num_images // args.bs), desc="Generating Images", position=0):
     wandb.log(
         {"inner_iter": i}
     )
+    
+    ## Image Seeds
+    if args.seed > 0:
+        torch.manual_seed(args.seed)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        shape = (args.num_images//args.bs, args.bs * args.duplicate_size, 4, 64, 64)
+        init_latents = torch.randn(shape, device=device)
+    else:
+        init_latents = None
+    
     if init_latents is None:
         init_i = None
     else:
@@ -190,6 +196,9 @@ with torch.no_grad():
     
     wandb.log({
         f"eval_{args.reward}_rewards_mean": torch.mean(eval_rewards),
+        f"eval_{args.reward}_rewards_std": torch.std(eval_rewards),
+        f"eval_{args.reward}_rewards_median": torch.median(eval_rewards),
+        f"eval_{args.reward}_rewards_10%_quantile": torch.quantile(eval_rewards, 0.1),
     })
 
 

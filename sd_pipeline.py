@@ -5,13 +5,15 @@ from aesthetic_scorer import SinusoidalTimeMLP
 from typing import Callable, List, Optional, Union, Dict, Any
 import torchvision
 import numpy as np
+from tqdm import tqdm
+import wandb
 
 from diffusers.configuration_utils import FrozenDict
 
 import os
 import sys
 sys.path.append(os.getcwd())
-from diffusers_patch.ddim_with_kl import ddim_step_KL, predict_x0_from_xt, ddim_step_KL_modified
+from diffusers_patch.ddim_with_kl import ddim_step_KL, predict_x0_from_xt, ddim_step_KL_modified, ddim_step_KL_MCTS
 
 #from diffusers.loaders import FromCkptMixin, LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
@@ -203,8 +205,6 @@ class SMC_SDPipeline(StableDiffusionPipeline):
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     old_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-               
-
                 noise_pred = old_noise_pred 
 
                 ############################################################
@@ -216,6 +216,7 @@ class SMC_SDPipeline(StableDiffusionPipeline):
 
                 # Decoding: I Changed this part: We get multiple samples for each particle [Batch_size * Duplicates , 4, 64, 64  ]
                 # The following generates [Batch_size * Duplicates , 4, 64, 64  ]
+                
                 with torch.no_grad():
                     previous_latents = torch.clone(latents) 
                     latents, kl_terms = ddim_step_KL(
@@ -232,11 +233,11 @@ class SMC_SDPipeline(StableDiffusionPipeline):
                     latent_model_input = torch.cat([latents] * 2) 
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, timesteps[i+1])
                     noise_pred = self.unet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    cross_attention_kwargs=cross_attention_kwargs,
-                ).sample 
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        cross_attention_kwargs=cross_attention_kwargs,
+                    ).sample 
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     ggg_noise_pred = torch.clone(new_noise_pred) 
                     new_noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond) # Get noises corresponding to latents 
@@ -348,7 +349,6 @@ class SMC_SDPipeline(StableDiffusionPipeline):
             old_images = self.decode_latents(old_pred_original_sample)
             old_images = (old_images * 255).round().astype("uint8")
             old_images_scores = self.scorer(old_images)
-
             return np.exp( (images_scores-old_images_scores)/alpha)
 
         else: 
@@ -532,7 +532,6 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-
                 # predict the noise residual
                 noise_pred = self.unet(
                     latent_model_input,
@@ -540,7 +539,6 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                 ).sample
-
                 # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
@@ -729,7 +727,6 @@ class Decoding_nonbatch_SDPipeline(StableDiffusionPipeline):
                 weights, _ = self.scorer(latents, timesteps=t.repeat(im_pix.shape[0]))
             else:
                 weights, _ = self.scorer(im_pix, timesteps=t.repeat(im_pix.shape[0]))
-            
         return weights
 
 
@@ -1069,7 +1066,6 @@ class Decoding_SDPipeline(StableDiffusionPipeline):
                 #weights, _ = self.scorer(im_pix)
             
         return weights 
-
 
 
 class DPS_continuous_SDPipeline(StableDiffusionPipeline):
@@ -1681,6 +1677,310 @@ class Normal_continuous_SDPipeline(StableDiffusionPipeline):
         reward.backward()
         return latent.grad.clone()
 
+
+class Decoding_MCTS(StableDiffusionPipeline):
+    @torch.no_grad()
+    def __call__(
+        self,
+        prompt: Union[str, List[str]] = None,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        num_images_per_prompt: Optional[int] = 1,
+        eta: float = 0.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        negative_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        return_dict: bool = True,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: int = 1,
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        r"""
+        Function invoked when calling the pipeline for generation.
+        Args:
+            prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
+                instead.
+            height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The height in pixels of the generated image.
+            width (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
+                The width in pixels of the generated image.
+            num_inference_steps (`int`, *optional*, defaults to 50):
+                The number of denoising steps. More denoising steps usually lead to a higher quality image at the
+                expense of slower inference.
+            guidance_scale (`float`, *optional*, defaults to 7.5):
+                Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
+                `guidance_scale` is defined as `w` of equation 2. of [Imagen
+                Paper](https://arxiv.org/pdf/2205.11487.pdf). Guidance scale is enabled by setting `guidance_scale >
+                1`. Higher guidance scale encourages to generate images that are closely linked to the text `prompt`,
+                usually at the expense of lower image quality.
+            negative_prompt (`str` or `List[str]`, *optional*):
+                The prompt or prompts not to guide the image generation. If not defined, one has to pass
+                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
+                less than `1`).
+            num_images_per_prompt (`int`, *optional*, defaults to 1):
+                The number of images to generate per prompt.
+            eta (`float`, *optional*, defaults to 0.0):
+                Corresponds to parameter eta (η) in the DDIM paper: https://arxiv.org/abs/2010.02502. Only applies to
+                [`schedulers.DDIMScheduler`], will be ignored for others.
+            generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
+                One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
+                to make generation deterministic.
+            latents (`torch.FloatTensor`, *optional*):
+                Pre-generated noisy latents, sampled from a Gaussian distribution, to be used as inputs for image
+                generation. Can be used to tweak the same generation with different prompts. If not provided, a latents
+                tensor will ge generated by sampling using the supplied random `generator`.
+            prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
+                provided, text embeddings will be generated from `prompt` input argument.
+            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
+                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
+                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
+                argument.
+            output_type (`str`, *optional*, defaults to `"pil"`):
+                The output format of the generate image. Choose between
+                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
+                plain tuple.
+            callback (`Callable`, *optional*):
+                A function that will be called every `callback_steps` steps during inference. The function will be
+                called with the following arguments: `callback(step: int, timestep: int, latents: torch.FloatTensor)`.
+            callback_steps (`int`, *optional*, defaults to 1):
+                The frequency at which the `callback` function will be called. If not specified, the callback will be
+                called at every step.
+            cross_attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.cross_attention](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/cross_attention.py).
+        Examples:
+        Returns:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
+            [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] if `return_dict` is True, otherwise a `tuple.
+            When returning a tuple, the first element is a list with the generated images, and the second element is a
+            list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
+            (nsfw) content, according to the `safety_checker`.
+        """
+        # 0. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 1. Check inputs. Raise error if not correct
+        self.check_inputs(
+            prompt, height, width, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds
+        )
+
+        # 2. Define call parameters
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. Encode input prompt
+        prompt_embeds = self._encode_prompt(
+            prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            negative_prompt,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+        )
+
+        # 4. Prepare timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 5. Prepare latent variables
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+        #weights = self.calculate_initial_weight(latents)
+
+
+
+        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        # 7. Denoising loop
+        kl_loss = 0
+        
+        from mcts import TreePolicy
+        tree = TreePolicy(
+            pipeline=self, 
+            initial_children = latents, 
+            do_classifier_free_guidance=do_classifier_free_guidance, 
+            select_function=None,
+            prompt_embeds=prompt_embeds, 
+            cross_attention_kwargs=cross_attention_kwargs,
+            guidance_scale=guidance_scale,
+            eta=eta,
+            expansion_coef=self.expansion_coef
+        ) 
+        
+                # print(current_nodes.timesteps)
+                # print(current_nodes.values)
+                # print(current_nodes.visit_counts)
+                # print(current_nodes.values / current_nodes.visit_counts)
+        
+        
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+            
+        for i in tqdm(timesteps, position=1, desc="Timesteps", leave=False):
+            for _ in tqdm(range(self.nfe_per_action), position=2, desc="NFE Budget", leave=False):
+                current_nodes = tree.select()
+                tree.expand(nodes=current_nodes)
+                tree.backpropagate(current_nodes.get_children())
+            tree.act_and_prune(prune=True)
+
+            wandb.log({
+                "eval/reward_mean": tree.root_nodes.rewards.mean().detach().numpy(),
+                "eval/reward_std": tree.root_nodes.rewards.std().detach().numpy()},
+                commit=True
+            )
+        latents = tree.root_nodes.states
+
+        if output_type == "latent":
+            image = latents
+            has_nsfw_concept = None
+        elif output_type == "pil":
+            # 8. Post-processing
+            image = self.decode_latents(latents)
+
+            # 9. Run safety checker
+            #############################################
+            ## Disabled for correct evaluation of the reward
+            #############################################
+            #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+
+            # 10. Convert to PIL
+            image = self.numpy_to_pil(image)
+        else:
+            # 8. Post-processing
+            image = self.decode_latents(latents)
+
+            # 9. Run safety checker
+            #############################################
+            ## Disabled for correct evaluation of the reward
+            #############################################
+            #image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+
+        ##############
+        has_nsfw_concept = False
+        ##############
+
+        # Offload last model to CPU
+        if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
+            self.final_offload_hook.offload()
+
+        if not return_dict:
+            return (image, has_nsfw_concept)
+
+        return image, kl_loss
+
+    def setup_oracle(self, scorer):
+        self.scorer = scorer
+
+    def set_reward(self, reward):
+        self.reward = reward
+
+    def setup_scorer(self, scorer):
+        self.scorer = scorer
+        self.scorer.requires_grad_(False)
+        self.scorer.eval()
+
+    def set_target(self, target):
+        self.target = target
+
+    def set_guidance(self, guidance):
+        self.target_guidance = guidance
+        
+    def set_variant(self, variant):
+        self.variant = variant
+    
+    def set_parameters(self, batch_size, duplicate_size):
+        self.batch_size = batch_size
+        self.duplicate = duplicate_size
+
+    def set_nfe_per_action(self, nfe_per_action):
+        self.nfe_per_action = nfe_per_action
+        
+    def set_expansion_coef(self, expansion_coef):
+        self.expansion_coef = expansion_coef
+    
+    
+    @torch.no_grad()
+    def calculate_weight(self, latents, new_noise_pred, t): # t = 981, 961, 941 ..
+
+        if  self.variant == 'PM' and self.reward == 'compressibility':
+            pred_original_sample = predict_x0_from_xt(
+                                self.scheduler,
+                                new_noise_pred,   
+                                t,
+                                latents
+                            )
+            images = self.decode_latents(pred_original_sample)
+            images = (images * 255).round().astype("uint8")
+            weights = self.scorer(images)
+            return weights           
+        ## Calculate E[x_0|x_t]
+        if self.variant == 'PM':
+            pred_original_sample = predict_x0_from_xt(
+                                        self.scheduler,
+                                        new_noise_pred,   
+                                        t,
+                                        latents
+                                    )
+            im_pix_un = self.vae.decode(pred_original_sample.to(self.vae.dtype) / 0.18215).sample
+        elif self.variant == 'MC':
+            im_pix_un = self.vae.decode(latents.to(self.vae.dtype) / 0.18215).sample
+            
+        im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
+
+        # resize = torchvision.transforms.Resize(224, antialias=False)
+        if self.reward == 'compressibility':
+            resize = torchvision.transforms.Resize(512, antialias=False)
+        elif self.reward == 'aesthetic':
+            resize = torchvision.transforms.Resize(224, antialias=False)
+        else:
+            raise ValueError('Invalid reward type')
+        
+        im_pix = resize(im_pix)
+        normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                                std=[0.26862954, 0.26130258, 0.27577711])
+        im_pix = normalize(im_pix).to(im_pix_un.dtype)
+        
+        if self.variant == 'PM':
+            weights, _ = self.scorer(im_pix)
+        elif self.variant == 'MC':
+            if self.reward == 'compressibility':
+                weights, _ = self.scorer(latents, timesteps=t.repeat(im_pix.shape[0]))
+            else:
+                weights, _ = self.scorer(im_pix, timesteps=t.repeat(im_pix.shape[0]))
+            
+        return weights
+
 if __name__ == "__main__":
     
     torch.cuda.empty_cache()
@@ -1727,3 +2027,7 @@ if __name__ == "__main__":
             init_i = init_latents[i]
         image_ = pipeline(eval_prompts, num_images_per_prompt=batch_size, latents=init_i).images # List of PIL.Image objects
         image.extend(image_)
+
+
+
+
