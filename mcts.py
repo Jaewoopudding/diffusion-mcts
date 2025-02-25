@@ -152,7 +152,7 @@ class TreePolicy:
         
         for nodes in tqdm(list(zip(*self.root_nodes.get_novel_children())), desc='Initial Evaluating', leave=False, position=3):
             self.evaluate(BatchedNode(nodes))
-        self.backpropagate(self.root_nodes.get_children())
+            self.backpropagate(nodes)
         
 
 
@@ -173,9 +173,9 @@ class TreePolicy:
                 parent_visits_tensor = torch.tensor(parent_visits, dtype=torch.float32, device=self.device)
                 # 자식들의 value와 visit_count를 torch 텐서로 만듭니다.
                 child_values = torch.tensor([child.value for child in current.get_children()],
-                                            dtype=torch.float32, device=self.device)
+                                            dtype=torch.float32, device=self.device).squeeze()
                 child_visits = torch.tensor([child.visit_count for child in current.get_children()],
-                                            dtype=torch.float32, device=self.device)
+                                            dtype=torch.float32, device=self.device).squeeze()
                 # UCT 값 계산: avg_value + exploration term
                 uct_values = child_values / child_visits + \
                             self.exploration_constant * torch.sqrt(torch.log(parent_visits_tensor) / child_visits)
@@ -243,8 +243,33 @@ class TreePolicy:
         # 평가(evaluate) 단계: 각 부모의 자식들에 대해 reward 계산 
         for nodes in tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=3):
             self.evaluate(BatchedNode(nodes))
+            self.backpropagate(nodes)
 
 
+    def get_final_latent(self):
+        if self.do_classifier_free_guidance:
+            final_latents = torch.cat([self.root_nodes.states] * 2, dim=0)  # (2B, C, H, W)
+        else:
+            final_latents = self.root_nodes.states.states  # (B, C, H, W)
+        
+        latent_model_input = self.pipeline.scheduler.scale_model_input(final_latents, self.root_nodes.timesteps)
+        noise_pred = self.pipeline.unet(
+                latent_model_input, 
+                self.root_nodes.timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else self.root_nodes.timesteps, 
+                encoder_hidden_states= self.prompt_embeds, 
+                cross_attention_kwargs=self.cross_attention_kwargs
+        ).sample    
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        new_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) 
+        pred_original_sample = predict_x0_from_xt_MCTS( ## TODO DDIM으로 안 바꿔도 되는지?
+                                        self.pipeline.scheduler,
+                                        new_noise_pred,   
+                                        self.root_nodes.timesteps,
+                                        self.root_nodes.states
+        )
+        return pred_original_sample
+    
+    
     @torch.no_grad()
     def evaluate(self, batched_nodes):
         if  self.pipeline.variant == 'PM' and self.pipeline.reward == 'compressibility':
@@ -320,15 +345,14 @@ class TreePolicy:
         batched_nodes.rewards = evaluation
         return evaluation
         
-    def backpropagate(self,  batched_children):
-        for children in batched_children:
-            for child in children:
-                r = child.reward  
-                current = child
-                while current is not None:
-                    current.visit_count += 1
-                    current.value += r
-                    current = current.get_parent()
+    def backpropagate(self,  children):
+        for child in children:
+            r = child.reward  
+            current = child
+            while current is not None:
+                current.visit_count += 1
+                current.value += r
+                current = current.get_parent()
 
     def _free_subtree(self, node):
         for child in node.get_children():
@@ -352,9 +376,9 @@ class TreePolicy:
                 
                 # 각 자식의 value와 visit_count를 torch 텐서로 변환
                 child_values = torch.tensor([child.value for child in children],
-                                            dtype=torch.float32, device=self.device)
+                                            dtype=torch.float32, device=self.device).squeeze()
                 child_visits = torch.tensor([child.visit_count if child.visit_count > 0 else 1 for child in children],
-                                            dtype=torch.float32, device=self.device)
+                                            dtype=torch.float32, device=self.device).squeeze()
 
                 uct_values = child_values / child_visits # + self.exploration_constant * torch.sqrt(torch.log(parent_visits_tensor) / child_visits)
                 best_idx = torch.argmax(uct_values).item()
