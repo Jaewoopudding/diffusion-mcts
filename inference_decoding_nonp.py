@@ -23,8 +23,8 @@ def parse():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--reward", type=str, default='aesthetic')
     parser.add_argument("--out_dir", type=str, default="")
-    parser.add_argument("--num_images", type=int, default=5)
-    parser.add_argument("--bs", type=int, default=5)
+    parser.add_argument("--num_images", type=int, default=40)
+    parser.add_argument("--bs", type=int, default=4)
     parser.add_argument("--val_bs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--duplicate_size",type=int, default=20)  
@@ -165,6 +165,33 @@ elif args.reward == 'aesthetic':
     gt_dataset= AVACLIPDataset(image)    
     
 gt_dataloader = torch.utils.data.DataLoader(gt_dataset, batch_size=args.val_bs, shuffle=False)
+
+
+with torch.no_grad():
+    eval_rewards = []
+
+    
+    if args.reward == 'compressibility':
+        jpeg_compressibility_scores = jpeg_compressibility(image)
+        scores = torch.tensor(jpeg_compressibility_scores, dtype=image.dtype, device=image.device)
+        
+    elif args.reward == 'aesthetic':
+        import torchvision
+        resize = torchvision.transforms.Resize(224, antialias=False)
+        normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+        img = normalize(resize(torch.tensor(np.array(image)).permute(0,3,1,2)) / 255).to(device)
+        score = scorer(img)[0]
+        print(f"eval_{args.reward}_rewards_mean --> tree.evaluate, DAS rewarding!", torch.mean(score))
+    
+    wandb.log({
+        f"das/eval_{args.reward}_rewards_mean": torch.mean(score),
+        f"das/eval_{args.reward}_rewards_std": torch.std(score),
+        f"das/eval_{args.reward}_rewards_median": torch.median(score),
+        f"das/eval_{args.reward}_rewards_90%_quantile": torch.quantile(score, 0.1),
+        f"das/eval_{args.reward}_rewards_10%_quantile": torch.quantile(score, 0.9),
+    })
+
+
 
 with torch.no_grad():
     eval_rewards = []

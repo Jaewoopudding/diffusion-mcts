@@ -42,7 +42,7 @@ args = parse()
 device= args.device
 save_file = True
 
-run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
+run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_C={args.expansion_coef}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
 unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
 run_name = run_name + '_' + unique_id
 
@@ -125,7 +125,7 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images", posit
         torch.manual_seed(args.seed)
         random.seed(args.seed)
         np.random.seed(args.seed)
-        shape = (args.num_images//args.bs, args.bs * args.duplicate_size, 4, 64, 64)
+        shape = (args.num_images//args.bs, args.bs * args.duplicate_size * args.nfe_per_action, 4, 64, 64)
         init_latents = torch.randn(shape, device=device)
     else:
         init_latents = None
@@ -171,6 +171,51 @@ elif args.reward == 'aesthetic':
     gt_dataset= AVACLIPDataset(image)    
     
 gt_dataloader = torch.utils.data.DataLoader(gt_dataset, batch_size=args.val_bs, shuffle=False)
+# # equivalent with the tree.evaluate logic
+# import torchvision
+# resize = torchvision.transforms.Resize(224)
+# normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+# img = normalize(resize(torch.tensor(np.array(image)).permute(0,3,1,2)) / 255).to(device)
+# score = scorer(img)[0]
+# scorer(normalize(resize(torch.tensor(np.array(image)).permute(0,3,1,2)) / 255).to(device))[0]
+
+# image_path = "/home/jaewoo/research/diffusion-mcts/SVDD-image/001_snail | reward: 8.43678092956543.png"
+# IMG = Image.open(image_path).convert("RGB")
+# scorer(normalize(resize(torch.tensor(np.array(IMG)[np.newaxis, :, :, :]).permute(0,3,1,2)) / 255).to(device))[0]
+# 
+# scorer(gt_dataset.processor(images=np.array(IMG)[np.newaxis, :, :, :], return_tensors='pt')['pixel_values'].to(device))[0]
+
+# 데이터셋에서 프로세서 꺼내오기
+# gt_dataset.processor(images=gt_dataset.data, return_tensors='pt')['pixel_values'].to(device)
+# scorer(gt_dataset.processor(images=gt_dataset.data, return_tensors='pt')['pixel_values'].to(device))[0]
+# scorer(gt_dataset.processor(images=np.array(image), return_tensors='pt')['pixel_values'].to(device))[0]
+
+# np.array(gt_dataset.data[0]) == np.array(image[0])
+
+with torch.no_grad():
+    eval_rewards = []
+
+    
+    if args.reward == 'compressibility':
+        jpeg_compressibility_scores = jpeg_compressibility(image)
+        scores = torch.tensor(jpeg_compressibility_scores, dtype=image.dtype, device=image.device)
+        
+    elif args.reward == 'aesthetic':
+        import torchvision
+        resize = torchvision.transforms.Resize(224, antialias=False)
+        normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+        img = normalize(resize(torch.tensor(np.array(image)).permute(0,3,1,2)) / 255).to(device)
+        score = scorer(img)[0]
+        print(f"eval_{args.reward}_rewards_mean --> tree.evaluate, DAS rewarding!", torch.mean(score))
+    
+    wandb.log({
+        f"das/eval_{args.reward}_rewards_mean": torch.mean(score),
+        f"das/eval_{args.reward}_rewards_std": torch.std(score),
+        f"das/eval_{args.reward}_rewards_median": torch.median(score),
+        f"das/eval_{args.reward}_rewards_90%_quantile": torch.quantile(score, 0.1),
+        f"das/eval_{args.reward}_rewards_10%_quantile": torch.quantile(score, 0.9),
+    })
+
 
 with torch.no_grad():
     eval_rewards = []
@@ -198,7 +243,8 @@ with torch.no_grad():
         f"eval_{args.reward}_rewards_mean": torch.mean(eval_rewards),
         f"eval_{args.reward}_rewards_std": torch.std(eval_rewards),
         f"eval_{args.reward}_rewards_median": torch.median(eval_rewards),
-        f"eval_{args.reward}_rewards_10%_quantile": torch.quantile(eval_rewards, 0.1),
+        f"eval_{args.reward}_rewards_90%_quantile": torch.quantile(eval_rewards, 0.1),
+        f"eval_{args.reward}_rewards_10%_quantile": torch.quantile(eval_rewards, 0.9),
     })
 
 
