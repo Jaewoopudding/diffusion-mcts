@@ -146,8 +146,8 @@ class TreePolicy:
         # initial node for x_T starting point
         self.root_nodes = BatchedNode(node_list)
         self.root_nodes.add_children(
-            initial_children.view(pipeline.batch_size, pipeline.duplicate, *initial_children.shape[1:]), 
-            torch.ones(pipeline.batch_size, pipeline.duplicate, device=self.device) * pipeline.scheduler.timesteps[0]
+            initial_children.view(pipeline.batch_size, pipeline.duplicate * pipeline.nfe_per_action, *initial_children.shape[1:]), 
+            torch.ones(pipeline.batch_size, pipeline.duplicate * pipeline.nfe_per_action, device=self.device) * pipeline.scheduler.timesteps[0]
         )
         
         for nodes in tqdm(list(zip(*self.root_nodes.get_novel_children())), desc='Initial Evaluating', leave=False, position=3):
