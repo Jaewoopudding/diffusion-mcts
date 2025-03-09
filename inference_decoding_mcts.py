@@ -16,7 +16,9 @@ from tqdm import tqdm
 import datetime
 from compressibility_scorer import CompressibilityScorerDiff, jpeg_compressibility, CompressibilityScorer_modified
 from aesthetic_scorer import AestheticScorerDiff
-
+from torch.amp import autocast
+import warnings
+warnings.filterwarnings("ignore")
 
 def parse():
     parser = argparse.ArgumentParser(description="Inference")
@@ -29,9 +31,11 @@ def parse():
     parser.add_argument("--expansion_coef", type=float, default=0.2)
     parser.add_argument("--val_bs", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--duplicate_size",type=int, default=20)  
+    parser.add_argument("--duplicate_size",type=int, default=2)  
     parser.add_argument("--variant", type=str, default="PM")
     parser.add_argument("--valuefunction", type=str, default="")
+    parser.add_argument("--progressive_widening", type=bool, default=False)
+    parser.add_argument("--pw_alpha", type=float, default=0.9)
     args = parser.parse_args()
     return args
 
@@ -39,10 +43,12 @@ def parse():
 ######### preparation ##########
 
 args = parse()
+if args.progressive_widening == False:
+    args.pw_alpha = 0.0
 device= args.device
 save_file = True
 
-run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_C={args.expansion_coef}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
+run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_C={args.expansion_coef}_PW={args.pw_alpha}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
 unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
 run_name = run_name + '_' + unique_id
 
@@ -76,6 +82,9 @@ sd_model.unet.requires_grad_(False)
 sd_model.vae.eval()
 sd_model.text_encoder.eval()
 sd_model.unet.eval()
+
+sd_model.set_progressive_widening(args.progressive_widening)
+sd_model.set_pw_alpha(args.pw_alpha)
 
 assert args.variant in ['PM', 'MC']
 
@@ -140,7 +149,8 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images", posit
     eval_prompts = list(eval_prompts)
     eval_prompt_list.extend(eval_prompts)
     
-    image_, kl_loss = sd_model(eval_prompts, num_images_per_prompt=1, eta=1.0, latents=init_i) # List of PIL.Image objects
+    with autocast(device_type=device):
+        image_, kl_loss = sd_model(eval_prompts, num_images_per_prompt=1, eta=1.0, latents=init_i) # List of PIL.Image objects      
     image.extend(image_)
     KL_list.append(kl_loss)
 

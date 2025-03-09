@@ -14,6 +14,7 @@ class Node:
         self.reward = reward
         self.timestep = timestep 
         self.value = 0
+        self.best_reward = None
         
     def get_parent(self):
         return self.parent
@@ -51,7 +52,7 @@ class BatchedNode:
     def states(self, new_states):
         assert new_states.shape[0] == self.batch_size, "Batch size mismatch in states setter."
         for i, node in enumerate(self.node_list):
-            node.state = new_states[i : i + 1]
+            node.state = new_states[i : i + 1].squeeze()
 
     @property
     def timesteps(self):
@@ -76,6 +77,11 @@ class BatchedNode:
         assert new_rewards.shape[0] == self.batch_size, "Batch size mismatch in rewards setter."
         for i, node in enumerate(self.node_list):
             node.reward = new_rewards[i : i + 1]
+            
+    @property
+    def best_rewards(self):
+        # 각 노드의 reward를 (B, ...) 형태로 결합합니다.
+        return torch.tensor([node.best_reward for node in self.node_list])
             
     @property
     def values(self):
@@ -114,7 +120,6 @@ class BatchedNode:
     def __getitem__(self, idx):
         return self.node_list[idx]
 
-
 class TreePolicy:
     def __init__(
             self, 
@@ -126,14 +131,17 @@ class TreePolicy:
             cross_attention_kwargs=None,
             guidance_scale=1.0,
             eta=1.0,
-            expansion_coef=0.2
+            expansion_coef=0.2,
+            progressive_widening=False,
+            pw_alpha=0.9
         ):
         self.prompt_embeds = prompt_embeds
         self.cross_attention_kwargs = cross_attention_kwargs
         self.guidance_scale = guidance_scale
         self.eta = eta
         self.select_function = select_function
-        self.progressive_widening = False
+        self.progressive_widening = progressive_widening
+        self.pw_alpha = pw_alpha
         self.pipeline = pipeline
         self.do_classifier_free_guidance = do_classifier_free_guidance
         self.expansion_coef = expansion_coef 
@@ -156,7 +164,7 @@ class TreePolicy:
         
 
 
-    def select(self):
+    def select(self, select_fn):
         """
         각 트리의 root부터 시작하여, 각 트리마다 leaf(또는 terminal) 노드까지 UCT 선택을 진행합니다.
         어떤 트리는 다른 트리보다 일찍 선택 과정이 끝날 수 있으므로, 각 트리에 대해 개별적으로 처리한 후
@@ -168,107 +176,112 @@ class TreePolicy:
             current = node
             # 자식이 존재하고 현재 노드가 leaf(terminal이 아님) 상태이면 계속 진행
             while current.get_children() and not current._terminal_checker(self.max_timestep):
-                # 부모의 방문 횟수 (0이면 1로 대체)
-                parent_visits = current.visit_count if current.visit_count > 0 else 1
-                parent_visits_tensor = torch.tensor(parent_visits, dtype=torch.float32, device=self.device)
-                # 자식들의 value와 visit_count를 torch 텐서로 만듭니다.
-                child_values = torch.tensor([child.value for child in current.get_children()],
-                                            dtype=torch.float32, device=self.device).squeeze()
-                child_visits = torch.tensor([child.visit_count for child in current.get_children()],
-                                            dtype=torch.float32, device=self.device).squeeze()
-                # UCT 값 계산: avg_value + exploration term
-                uct_values = child_values / child_visits + \
-                            self.exploration_constant * torch.sqrt(torch.log(parent_visits_tensor) / child_visits)
-                # 가장 높은 UCT 값을 가진 자식의 인덱스를 얻습니다.
-                best_idx = torch.argmax(uct_values).item()
+                if self.progressive_widening and (current.visit_count ** self.pw_alpha >= len(current.get_children())) and current.parent is not None:
+                    break
+                
+                parent_visits_tensor = torch.tensor(current.visit_count, dtype=torch.float32, device=self.device)
+                child_values = torch.tensor([child.value for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                child_visits = torch.tensor([child.visit_count for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
+                
+                best_idx = select_fn(parent_visits_tensor, child_values, child_visits)
                 best_child = current.get_children()[best_idx]
+                
                 current = best_child
             selected_nodes.append(current)
         # 선택된 노드들을 BatchedNode로 묶어 반환합니다.
         return BatchedNode(selected_nodes)
             
     
-    def expand(self, nodes):
+    def expand(self, nodes, use_gradient=False):
         """
         확장 단계: BatchedNode인 nodes의 각 노드(state)를 바탕으로 자식 노드들을 생성합니다.
         여기서는 각 노드가 pipeline.duplicate 만큼의 자식을 갖는다고 가정합니다.
         t와 latents는 현재 timestep과 latent 정보를 의미합니다.
         """
         # nodes.states: (B, C, H, W)
-        if self.do_classifier_free_guidance:
-            latent_model_input = torch.cat([nodes.states] * 2, dim=0)  # (2B, C, H, W)
-        else:
-            latent_model_input = nodes.states  # (B, C, H, W)
-        
-        # scale_model_input는 배치 지원
-        latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, nodes.timesteps)
-        noise_pred = self.pipeline.unet(
-            latent_model_input,
-            nodes.timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else nodes.timesteps,
-            encoder_hidden_states=self.prompt_embeds,
-            cross_attention_kwargs=self.cross_attention_kwargs,
-        ).sample
-
-        if self.do_classifier_free_guidance:
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
-            old_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+        grad_mode = torch.enable_grad() if use_gradient else torch.no_grad()
+        with grad_mode:
+            if self.do_classifier_free_guidance:
+                latent_model_input = torch.cat([nodes.states] * 2, dim=0)  # (2B, C, H, W)
+                if use_gradient:
+                    latent_model_input.requires_grad_(True)
+            else:
+                latent_model_input = nodes.states  # (B, C, H, W)
             
-        noise_pred = old_noise_pred 
+            # scale_model_input는 배치 지원
+            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, nodes.timesteps)
+            noise_pred = self.pipeline.unet(
+                latent_model_input,
+                nodes.timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else nodes.timesteps,
+                encoder_hidden_states=self.prompt_embeds,
+                cross_attention_kwargs=self.cross_attention_kwargs,
+            ).sample
+
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2, dim=0)
+                old_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+            noise_pred = old_noise_pred 
+                
+            # ddim_step_KL_modified: 노드의 상태에서 새로운 latent 후보들을 생성
+            # new_latents: (B * duplicate, C, H, W)
+            duplicate = self.pipeline.duplicate
+            new_latents, pred_original_sample, variance, _ = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
+                self.pipeline.scheduler,
+                noise_pred,    # 예측된 노이즈
+                old_noise_pred,
+                nodes.timesteps,
+                nodes.states,
+                eta=self.eta,
+                duplicate=duplicate
+            ) # (B * duplicate, C, H, W)
+            new_latents = new_latents.view(self.pipeline.batch_size, duplicate, *new_latents.shape[1:])
             
-        # ddim_step_KL_modified: 노드의 상태에서 새로운 latent 후보들을 생성
-        # new_latents: (B * duplicate, C, H, W)
-        duplicate = self.pipeline.duplicate
-        new_latents, kl_terms = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
-            self.pipeline.scheduler,
-            noise_pred,    # 예측된 노이즈
-            old_noise_pred,
-            nodes.timesteps,
-            nodes.states,
-            eta=self.eta,
-            duplicate=duplicate
-        ) # (B * duplicate, C, H, W)
-        new_latents = new_latents.view(self.pipeline.batch_size, duplicate, *new_latents.shape[1:])
-
-        step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
-        new_timesteps = nodes.timesteps - step_offset
-        mask = new_timesteps >= 0
-        new_timesteps = torch.where(
-            mask, 
-            new_timesteps, 
-            torch.zeros_like(new_timesteps, device=new_timesteps.device) 
-        ).repeat_interleave(duplicate).view(self.pipeline.batch_size, duplicate)
-        
-        # 각 배치별로 자식 노드 리스트 생성: 각 부모는 duplicate 개의 자식을 가짐.
-        nodes.add_children(new_latents, new_timesteps)
-        # 평가(evaluate) 단계: 각 부모의 자식들에 대해 reward 계산 
-        for nodes in tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=3):
-            self.evaluate(BatchedNode(nodes))
-            self.backpropagate(nodes)
-
-
-    def get_final_latent(self):
-        if self.do_classifier_free_guidance:
-            final_latents = torch.cat([self.root_nodes.states] * 2, dim=0)  # (2B, C, H, W)
-        else:
-            final_latents = self.root_nodes.states.states  # (B, C, H, W)
-        
-        latent_model_input = self.pipeline.scheduler.scale_model_input(final_latents, self.root_nodes.timesteps)
-        noise_pred = self.pipeline.unet(
-                latent_model_input, 
-                self.root_nodes.timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else self.root_nodes.timesteps, 
-                encoder_hidden_states= self.prompt_embeds, 
-                cross_attention_kwargs=self.cross_attention_kwargs
-        ).sample    
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-        new_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) 
-        pred_original_sample = predict_x0_from_xt_MCTS( ## TODO DDIM으로 안 바꿔도 되는지?
-                                        self.pipeline.scheduler,
-                                        new_noise_pred,   
-                                        self.root_nodes.timesteps,
-                                        self.root_nodes.states
-        )
-        return pred_original_sample
+            if use_gradient:
+                breakpoint()
+                image = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / 0.18215)[0]
+                im_pix = ((image / 2) + 0.5).clamp(0, 1) 
+                
+                
+                if self.pipeline.reward == 'compressibility':
+                    resize = torchvision.transforms.Resize(512, antialias=False)
+                elif self.pipeline.reward == 'aesthetic':
+                    resize = torchvision.transforms.Resize(224, antialias=False)
+                else:
+                    raise ValueError('Invalid reward type')
+                    
+                im_pix = resize(im_pix)
+                normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+                im_pix = normalize(im_pix).to(image.dtype)
+                
+                if self.pipeline.variant == 'PM':
+                    evaluation, _ = self.pipeline.scorer(im_pix)
+                elif self.pipeline.variant == 'MC':
+                    if self.pipeline.reward == 'compressibility':
+                        evaluation, _ = self.pipeline.scorer(nodes.states, timesteps=nodes.timesteps) ### TODO timestep!!! 
+                    else:
+                        evaluation, _ = self.pipeline.scorer(im_pix, timesteps=nodes.timesteps)
     
+                guidance = torch.autograd.grad(outputs=evaluation, inputs=image)[0]
+
+                new_latents = new_latents + variance * guidance
+                
+
+            step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
+            new_timesteps = nodes.timesteps - step_offset
+            mask = new_timesteps >= 0
+            new_timesteps = torch.where(
+                mask, 
+                new_timesteps, 
+                torch.zeros_like(new_timesteps, device=new_timesteps.device) 
+            ).repeat_interleave(duplicate).view(self.pipeline.batch_size, duplicate)
+            
+            # 각 배치별로 자식 노드 리스트 생성: 각 부모는 duplicate 개의 자식을 가짐.
+            nodes.add_children(new_latents, new_timesteps)
+            # 평가(evaluate) 단계: 각 부모의 자식들에 대해 reward 계산 
+            for nodes in tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=3):
+                self.evaluate(BatchedNode(nodes))
+                self.backpropagate(nodes)
     
     @torch.no_grad()
     def evaluate(self, batched_nodes):
@@ -352,6 +365,8 @@ class TreePolicy:
             while current is not None:
                 current.visit_count += 1
                 current.value += r
+                if (current.best_reward) is None or (r > current.best_reward):
+                    current.best_reward = r
                 current = current.get_parent()
 
     def _free_subtree(self, node):
@@ -364,34 +379,41 @@ class TreePolicy:
         node.children.clear()
         node.parent = None
 
-    def act_and_prune(self, prune=True):
+    def act_and_prune(self, select_fn, prune=True):
         selected_nodes = []
         for node in self.root_nodes:
             current = node
             children = current.get_children()
             if children: 
-                # 부모의 visit_count가 0이면 1로 대체
-                parent_visits = current.visit_count if current.visit_count > 0 else 1
-                parent_visits_tensor = torch.tensor(parent_visits, dtype=torch.float32, device=self.device)
+                parent_visits_tensor = torch.tensor(current.visit_count, dtype=torch.float32, device=self.device)
+                child_values = torch.tensor([child.value for child in children], dtype=torch.float32, device=self.device).squeeze()
+                child_visits = torch.tensor([child.visit_count for child in current.get_children()], dtype=torch.float32, device=self.device).squeeze()
                 
-                # 각 자식의 value와 visit_count를 torch 텐서로 변환
-                child_values = torch.tensor([child.value for child in children],
-                                            dtype=torch.float32, device=self.device).squeeze()
-                child_visits = torch.tensor([child.visit_count if child.visit_count > 0 else 1 for child in children],
-                                            dtype=torch.float32, device=self.device).squeeze()
-
-                uct_values = child_values / child_visits # + self.exploration_constant * torch.sqrt(torch.log(parent_visits_tensor) / child_visits)
-                best_idx = torch.argmax(uct_values).item()
+                best_idx = select_fn(parent_visits_tensor, child_values, child_visits)
                 best_child = children[best_idx]
+                
                 # 선택되지 않은 자식들은 재귀적으로 메모리 해제
-                if prune:
-                    for i, child in enumerate(children):
-                        if i != best_idx:
-                            self._free_subtree(child)
+                # if prune:
+                #     for i, child in enumerate(children):
+                #         if i != best_idx:
+                #             self._free_subtree(child)
                 current = best_child
             selected_nodes.append(current)
-        # 새로운 루트 노드들로 업데이트
         self.root_nodes = BatchedNode(selected_nodes)
         # GPU 메모리 비우기
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            
+    def _calc_guidance(self, calculated_reward, image, alpha=0.05):
+        guidance = torch.autograd.grad(outputs=calculated_reward, inputs=image, grad_outputs=torch.ones_like(calculated_reward))[0]
+        return guidance
+    
+    def get_final_latent(self):
+        return self.root_nodes.states
+    
+    def UCT(self, parent_visits_tensor, child_values, child_visits):
+        uct_values = child_values / child_visits + self.exploration_constant * torch.sqrt(torch.log(parent_visits_tensor) / child_visits)
+        return torch.argmax(uct_values).item()
+
+    def max_value(self, parent_visits_tensor, child_values, child_visits):
+        return torch.argmax(child_values / child_visits).item()
