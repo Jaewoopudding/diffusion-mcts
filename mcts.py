@@ -133,7 +133,8 @@ class TreePolicy:
             eta=1.0,
             expansion_coef=0.2,
             progressive_widening=False,
-            pw_alpha=0.9
+            pw_alpha=0.9,
+            kl_lagrangian_coef=0.3
         ):
         self.prompt_embeds = prompt_embeds
         self.cross_attention_kwargs = cross_attention_kwargs
@@ -147,6 +148,8 @@ class TreePolicy:
         self.expansion_coef = expansion_coef 
         self.exploration_constant = expansion_coef  # UCT 상수로 사용
         self.max_timestep = self.pipeline.scheduler.timesteps[-1] 
+        self.kl_lagrangian_coef = torch.tensor(kl_lagrangian_coef, device=pipeline.device).to(torch.float32)
+        self.lookforward_fn = lambda r: r / self.kl_lagrangian_coef
         # initial_children: torch.Tensor of shape (B * duplicate, C, H, W)
         node_list = [Node(state=None, timestep=None, parent=None, reward=None) for _ in range(pipeline.batch_size)]
         self.device = pipeline.device
@@ -192,7 +195,7 @@ class TreePolicy:
         return BatchedNode(selected_nodes)
             
     
-    def expand(self, nodes, use_gradient=False):
+    def expand(self, nodes, use_gradient=True):
         """
         확장 단계: BatchedNode인 nodes의 각 노드(state)를 바탕으로 자식 노드들을 생성합니다.
         여기서는 각 노드가 pipeline.duplicate 만큼의 자식을 갖는다고 가정합니다.
@@ -201,12 +204,13 @@ class TreePolicy:
         # nodes.states: (B, C, H, W)
         grad_mode = torch.enable_grad() if use_gradient else torch.no_grad()
         with grad_mode:
+            latent = nodes.states
+            if use_gradient:
+                latent.requires_grad_(True)
             if self.do_classifier_free_guidance:
-                latent_model_input = torch.cat([nodes.states] * 2, dim=0)  # (2B, C, H, W)
-                if use_gradient:
-                    latent_model_input.requires_grad_(True)
+                latent_model_input = torch.cat([latent] * 2, dim=0)  # (2B, C, H, W)
             else:
-                latent_model_input = nodes.states  # (B, C, H, W)
+                latent_model_input = latent  # (B, C, H, W)
             
             # scale_model_input는 배치 지원
             latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, nodes.timesteps)
@@ -226,7 +230,7 @@ class TreePolicy:
             # ddim_step_KL_modified: 노드의 상태에서 새로운 latent 후보들을 생성
             # new_latents: (B * duplicate, C, H, W)
             duplicate = self.pipeline.duplicate
-            new_latents, pred_original_sample, variance, _ = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
+            new_latents, pred_original_sample, variance_coeff, _, _ = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
                 self.pipeline.scheduler,
                 noise_pred,    # 예측된 노이즈
                 old_noise_pred,
@@ -238,7 +242,6 @@ class TreePolicy:
             new_latents = new_latents.view(self.pipeline.batch_size, duplicate, *new_latents.shape[1:])
             
             if use_gradient:
-                breakpoint()
                 image = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / 0.18215)[0]
                 im_pix = ((image / 2) + 0.5).clamp(0, 1) 
                 
@@ -261,10 +264,10 @@ class TreePolicy:
                         evaluation, _ = self.pipeline.scorer(nodes.states, timesteps=nodes.timesteps) ### TODO timestep!!! 
                     else:
                         evaluation, _ = self.pipeline.scorer(im_pix, timesteps=nodes.timesteps)
-    
-                guidance = torch.autograd.grad(outputs=evaluation, inputs=image)[0]
+                evaluation = self.lookforward_fn(evaluation).to(torch.float32)
+                guidance = torch.autograd.grad(outputs=evaluation, inputs=latent, grad_outputs=torch.ones_like(evaluation))[0].detach()
 
-                new_latents = new_latents + variance * guidance
+                new_latents = new_latents + variance_coeff * guidance
                 
 
             step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
@@ -393,10 +396,10 @@ class TreePolicy:
                 best_child = children[best_idx]
                 
                 # 선택되지 않은 자식들은 재귀적으로 메모리 해제
-                # if prune:
-                #     for i, child in enumerate(children):
-                #         if i != best_idx:
-                #             self._free_subtree(child)
+                if prune:
+                    for i, child in enumerate(children):
+                        if i != best_idx:
+                            self._free_subtree(child)
                 current = best_child
             selected_nodes.append(current)
         self.root_nodes = BatchedNode(selected_nodes)
