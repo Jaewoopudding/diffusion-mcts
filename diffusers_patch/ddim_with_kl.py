@@ -573,7 +573,7 @@ def ddim_step_KL_MCTS(
         prev_sample = prev_sample_mean
         kl_terms = torch.zeros(prev_sample_mean.size(0), device=prev_sample_mean.device)
 
-    return prev_sample.to(dtype=sample.dtype), kl_terms
+    return prev_sample.to(dtype=sample.dtype), pred_original_sample, variance, kl_terms
 
 
 def predict_x0_from_xt_MCTS(
