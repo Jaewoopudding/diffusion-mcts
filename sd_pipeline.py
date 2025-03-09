@@ -1802,7 +1802,8 @@ class Decoding_MCTS(StableDiffusionPipeline):
 
         # 4. Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        timesteps = torch.cat([self.scheduler.timesteps, torch.zeros(1, device=device)]) # chagepoint: the zero is appended for the initial noise search (1000 -> 981)
+        
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
@@ -1836,45 +1837,31 @@ class Decoding_MCTS(StableDiffusionPipeline):
             cross_attention_kwargs=cross_attention_kwargs,
             guidance_scale=guidance_scale,
             eta=eta,
-            expansion_coef=self.expansion_coef
+            expansion_coef=self.expansion_coef,
+            progressive_widening=self.progressive_widening,
+            pw_alpha=self.pw_alpha
         ) 
-        
-                # print(current_nodes.timesteps)
-                # print(current_nodes.values)
-                # print(current_nodes.visit_counts)
-                # print(current_nodes.values / current_nodes.visit_counts)
-        
         
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             
         for i in tqdm(timesteps, position=1, desc="Timesteps", leave=False):
             for _ in tqdm(range(self.nfe_per_action), position=2, desc="NFE Budget", leave=False):
-                current_nodes = tree.select()
+                current_nodes = tree.select(select_fn=tree.UCT)
                 tree.expand(nodes=current_nodes)    
-                # print("eval/current_node_rewards: ", current_nodes.rewards.squeeze().cpu().detach().numpy())
-                # print("eval/current_node_timesteps: ", current_nodes.timesteps.squeeze().cpu().detach().numpy())
-                # print("eval/current_node_values: ", current_nodes.values.squeeze().cpu().detach().numpy())
-                # print("eval/current_node_visit_counts: ", current_nodes.visit_counts.squeeze().cpu().detach().numpy())
-                # print("eval/current_node_values_per_visit: " , (current_nodes.values.squeeze() / current_nodes.visit_counts.squeeze()).cpu().detach().numpy())
-            tree.act_and_prune(prune=True)
-            # print("***************************************************************************")
+            tree.act_and_prune(select_fn=tree.max_value, prune=True)  
+            # In this line, timestep of the root node have to be same with the "i"
             wandb.log({
+                # 
                 "eval/reward_mean": tree.root_nodes.rewards.squeeze().mean().cpu().detach().numpy(),
                 "eval/reward_max": tree.root_nodes.rewards.squeeze().max().cpu().detach().numpy(),
                 "eval/reward_min": tree.root_nodes.rewards.squeeze().min().cpu().detach().numpy(),
                 "eval/reward_std": tree.root_nodes.rewards.squeeze().std().cpu().detach().numpy(),
+                "eval/best_reward_mean_of_root_node": tree.root_nodes.best_rewards.squeeze().mean().cpu().detach().numpy(),
                 "eval/current_node_timesteps": current_nodes.timesteps.mean().squeeze().cpu().detach().numpy(),
                 "eval/current_node_values": current_nodes.values.squeeze().mean().cpu().detach().numpy(),
                 "eval/current_node_visit_counts": current_nodes.visit_counts.squeeze().float().mean().cpu().detach().numpy(),
                 "eval/current_node_values_per_visit": (current_nodes.values.squeeze() / current_nodes.visit_counts.squeeze()).mean().cpu().detach().numpy()
             }, commit=True)
-            # print("eval/root_node_rewards: ",tree.root_nodes.rewards.squeeze().cpu().detach().numpy())
-            # print("eval/root_node_timesteps: ",tree.root_nodes.timesteps.squeeze().cpu().detach().numpy())
-            # print("eval/root_node_values: ",tree.root_nodes.values.squeeze().cpu().detach().numpy())
-            # print("eval/root_node_visit_counts: ",tree.root_nodes.visit_counts.squeeze().cpu().detach().numpy())
-            # print("eval/root_node_values_per_visit: ",(tree.root_nodes.values.squeeze() / tree.root_nodes.visit_counts.squeeze()).cpu().detach().numpy())
-            # print("---------------------------------------------------")
-            # print("---------------------------------------------------")
             
         latents = tree.get_final_latent()
         if output_type == "latent":
@@ -1944,6 +1931,13 @@ class Decoding_MCTS(StableDiffusionPipeline):
         
     def set_expansion_coef(self, expansion_coef):
         self.expansion_coef = expansion_coef
+        
+    def set_progressive_widening(self, progressive_widening):
+        self.progressive_widening = progressive_widening
+        
+    def set_pw_alpha(self, pw_alpha):
+        self.pw_alpha = pw_alpha    
+    
     
     
     @torch.no_grad()
