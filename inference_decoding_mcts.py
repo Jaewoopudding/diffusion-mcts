@@ -36,6 +36,11 @@ def parse():
     parser.add_argument("--valuefunction", type=str, default="")
     parser.add_argument("--progressive_widening", type=bool, default=False)
     parser.add_argument("--pw_alpha", type=float, default=0.9)
+    parser.add_argument("--value_gradient", type=bool, default=False)
+    parser.add_argument("--kl_lagrangian_coef", type=float, default=0.005)
+    parser.add_argument("--num_inference_steps", type=int, default=50)
+    parser.add_argument("--tempering_gamma", type=float, default=0.008)
+    parser.add_argument("--jump_policy", type=str, default=None)
     args = parser.parse_args()
     return args
 
@@ -45,10 +50,13 @@ def parse():
 args = parse()
 if args.progressive_widening == False:
     args.pw_alpha = 0.0
+assert not ((args.value_gradient) == True and (args.reward == 'compressibility'))
+args.evaluation_budget = args.duplicate_size * args.nfe_per_action
+
 device= args.device
 save_file = True
 
-run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_C={args.expansion_coef}_PW={args.pw_alpha}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
+run_name = f"{args.variant}_M={args.duplicate_size}_NFE={args.nfe_per_action}_C={args.expansion_coef}_PW={args.pw_alpha}_G={args.value_gradient}:{args.kl_lagrangian_coef}_J={args.jump_policy}_{args.valuefunction.split('/')[-1] if args.valuefunction != '' else ''}"
 unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
 run_name = run_name + '_' + unique_id
 
@@ -73,7 +81,7 @@ sd_model.to(device)
 
 # switch to DDIM scheduler
 sd_model.scheduler = DDIMScheduler.from_config(sd_model.scheduler.config)
-sd_model.scheduler.set_timesteps(50, device=device)
+sd_model.scheduler.set_timesteps(args.num_inference_steps, device=device)
 
 sd_model.vae.requires_grad_(False)
 sd_model.text_encoder.requires_grad_(False)
@@ -85,6 +93,10 @@ sd_model.unet.eval()
 
 sd_model.set_progressive_widening(args.progressive_widening)
 sd_model.set_pw_alpha(args.pw_alpha)
+sd_model.set_value_gradient(args.value_gradient)
+sd_model.set_kl_lagrangian_coef(args.kl_lagrangian_coef)
+sd_model.set_tempering_gamma(args.tempering_gamma)
+sd_model.set_jump_policy(args.jump_policy)
 
 assert args.variant in ['PM', 'MC']
 
@@ -148,7 +160,6 @@ for i in tqdm(range(args.num_images // args.bs), desc="Generating Images", posit
     )
     eval_prompts = list(eval_prompts)
     eval_prompt_list.extend(eval_prompts)
-    
     with autocast(device_type=device):
         image_, kl_loss = sd_model(eval_prompts, num_images_per_prompt=1, eta=1.0, latents=init_i) # List of PIL.Image objects      
     image.extend(image_)

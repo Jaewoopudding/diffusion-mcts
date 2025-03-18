@@ -1180,6 +1180,7 @@ class DPS_continuous_SDPipeline(StableDiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
+        
         prompt_embeds = self._encode_prompt(
             prompt,
             device,
@@ -1368,7 +1369,6 @@ class DPS_continuous_SDPipeline(StableDiffusionPipeline):
         normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
                                                 std=[0.26862954, 0.26130258, 0.27577711])
         im_pix = normalize(im_pix).to(im_pix_un.dtype)
-            
         rewards, _ = self.scorer(im_pix)
         reward = rewards.mean()
         
@@ -1799,9 +1799,7 @@ class Decoding_MCTS(StableDiffusionPipeline):
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
         )
-
         # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = torch.cat([self.scheduler.timesteps, torch.zeros(1, device=device)]) # chagepoint: the zero is appended for the initial noise search (1000 -> 981)
         
 
@@ -1839,7 +1837,9 @@ class Decoding_MCTS(StableDiffusionPipeline):
             eta=eta,
             expansion_coef=self.expansion_coef,
             progressive_widening=self.progressive_widening,
-            pw_alpha=self.pw_alpha
+            pw_alpha=self.pw_alpha,
+            kl_lagrangian_coef=self.kl_lagrangian_coef,
+            tempering_gamma=self.tempering_gamma
         ) 
         
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
@@ -1847,11 +1847,11 @@ class Decoding_MCTS(StableDiffusionPipeline):
         for i in tqdm(timesteps, position=1, desc="Timesteps", leave=False):
             for _ in tqdm(range(self.nfe_per_action), position=2, desc="NFE Budget", leave=False):
                 current_nodes = tree.select(select_fn=tree.UCT)
-                tree.expand(nodes=current_nodes)    
+                tree.expand(nodes=current_nodes, use_gradient=self.value_gradient, jump=self.jump_policy)    
             tree.act_and_prune(select_fn=tree.max_value, prune=True)  
             # In this line, timestep of the root node have to be same with the "i"
+            
             wandb.log({
-                # 
                 "eval/reward_mean": tree.root_nodes.rewards.squeeze().mean().cpu().detach().numpy(),
                 "eval/reward_max": tree.root_nodes.rewards.squeeze().max().cpu().detach().numpy(),
                 "eval/reward_min": tree.root_nodes.rewards.squeeze().min().cpu().detach().numpy(),
@@ -1938,7 +1938,17 @@ class Decoding_MCTS(StableDiffusionPipeline):
     def set_pw_alpha(self, pw_alpha):
         self.pw_alpha = pw_alpha    
     
+    def set_value_gradient(self, value_gradient):
+        self.value_gradient = value_gradient
+        
+    def set_kl_lagrangian_coef(self, kl_lagrangian_coef):
+        self.kl_lagrangian_coef = kl_lagrangian_coef
     
+    def set_tempering_gamma(self, tempering_gamma):
+        self.tempering_gamma = tempering_gamma
+        
+    def set_jump_policy(self, jump_policy):
+        self.jump_policy = jump_policy
     
     @torch.no_grad()
     def calculate_weight(self, latents, new_noise_pred, t): # t = 981, 961, 941 ..

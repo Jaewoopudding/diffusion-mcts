@@ -472,6 +472,7 @@ def ddim_step_KL_MCTS(
     use_clipped_model_output: bool = False,
     generator=None,
     variance_noise: Optional[torch.FloatTensor] = None,
+    jump_step: int =None, 
 ) -> Union[DDIMSchedulerOutput, Tuple]:
     # Ensure that timestep is of long type for indexing
     timestep = timestep.long()
@@ -480,7 +481,8 @@ def ddim_step_KL_MCTS(
         raise ValueError(
             "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
         )
-
+    jump_prev_sample = None
+    jump_variance_coeff = None
     # 1. Get previous step value (element-wise)
     # Note: self.config.num_train_timesteps//self.num_inference_steps is an int.
     step_offset = self.config.num_train_timesteps // self.num_inference_steps
@@ -571,11 +573,34 @@ def ddim_step_KL_MCTS(
 
         kl_terms = (prev_sample_mean - old_prev_sample_mean)**2 / (2 * (std_dev_t**2))
         kl_terms = kl_terms.mean(dim=tuple(range(1, kl_terms.ndim)))
+        
+        if jump_step is not None:
+            jump_timestep = timestep - jump_step
+            jump_mask = (jump_timestep >= 0).to(timestep.device)
+            alpha_prod_t_jump = torch.where(
+                    jump_mask, 
+                    self.alphas_cumprod.to(timestep.device)[prev_timestep],  # valid entries
+                    self.final_alpha_cumprod.expand_as(timestep).to(timestep.device)  # broadcast final_alpha_cumprod for invalid ones
+            )
+            alpha_prod_t_jump = alpha_prod_t_jump.view(-1, 1, 1, 1)
+            beta_prod_t_jump = 1 - alpha_prod_t_jump
+            jump_variance = ((beta_prod_t_jump / beta_prod_t) * (1 - alpha_prod_t / alpha_prod_t_jump)).view(-1, 1, 1, 1)
+            jump_variance_coeff = jump_variance
+            
+            jump_std_dev_t = eta * jump_variance.sqrt()
+            
+            jump_pred_sample_direction = (1 - alpha_prod_t_jump - jump_std_dev_t**2).sqrt() * pred_epsilon
+            jump_prev_sample_mean = alpha_prod_t_jump.sqrt() * pred_original_sample + jump_pred_sample_direction
+
+            jump_variance = jump_std_dev_t.repeat_interleave(duplicate, dim=0) * variance_noise
+            jump_prev_sample_mean_repeated = jump_prev_sample_mean.repeat_interleave(duplicate, dim=0)  # shape: (B*duplicate, C, H, W)
+            jump_prev_sample = jump_prev_sample_mean_repeated + jump_variance
+        
     else:
         prev_sample = prev_sample_mean
         kl_terms = torch.zeros(prev_sample_mean.size(0), device=prev_sample_mean.device)
 
-    return prev_sample.to(dtype=sample.dtype), pred_original_sample, variance_coeff, variance, kl_terms
+    return prev_sample.to(dtype=sample.dtype), jump_prev_sample, pred_original_sample, variance_coeff, jump_variance_coeff, variance, kl_terms
 
 
 def predict_x0_from_xt_MCTS(

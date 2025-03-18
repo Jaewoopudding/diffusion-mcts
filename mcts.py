@@ -134,7 +134,8 @@ class TreePolicy:
             expansion_coef=0.2,
             progressive_widening=False,
             pw_alpha=0.9,
-            kl_lagrangian_coef=0.3
+            kl_lagrangian_coef=0.005,
+            tempering_gamma=0.008
         ):
         self.prompt_embeds = prompt_embeds
         self.cross_attention_kwargs = cross_attention_kwargs
@@ -149,6 +150,7 @@ class TreePolicy:
         self.exploration_constant = expansion_coef  # UCT 상수로 사용
         self.max_timestep = self.pipeline.scheduler.timesteps[-1] 
         self.kl_lagrangian_coef = torch.tensor(kl_lagrangian_coef, device=pipeline.device).to(torch.float32)
+        self.tempering_gamma = tempering_gamma
         self.lookforward_fn = lambda r: r / self.kl_lagrangian_coef
         # initial_children: torch.Tensor of shape (B * duplicate, C, H, W)
         node_list = [Node(state=None, timestep=None, parent=None, reward=None) for _ in range(pipeline.batch_size)]
@@ -164,7 +166,34 @@ class TreePolicy:
         for nodes in tqdm(list(zip(*self.root_nodes.get_novel_children())), desc='Initial Evaluating', leave=False, position=3):
             self.evaluate(BatchedNode(nodes))
             self.backpropagate(nodes)
+            
+        # state_and_reward = [(node.state, node.reward) for node in self.root_nodes.get_children()[0]]
+        # from sklearn.manifold import TSNE
+        # import matplotlib.pyplot as plt
+        # from matplotlib.colors import Normalize
         
+        # states = torch.stack([node[0] for node in state_and_reward])  # shape: (N, 4, 64, 64)
+        # rewards = torch.tensor([node[1] for node in state_and_reward])  # shape: (N, 1)
+
+        # # Flatten tensor for t-SNE (4*64*64)
+        # states_flat = states.view(states.size(0), -1).cpu().numpy()
+        # rewards_np = rewards.cpu().numpy().flatten()
+        # norm = Normalize(vmin=np.percentile(rewards_np, 5), vmax=np.percentile(rewards_np, 95))
+
+        # # t-SNE 적용
+        # tsne = TSNE(n_components=2, random_state=42)
+        # states_tsne = tsne.fit_transform(states_flat)
+
+        # # 시각화
+        # plt.figure(figsize=(10, 8))
+        # scatter = plt.scatter(states_tsne[:, 0], states_tsne[:, 1], c=rewards_np, cmap='plasma', alpha=0.7, norm=norm)
+        # plt.colorbar(scatter, label='Reward')
+        # plt.title('t-SNE visualization of states colored by reward')
+        # plt.xlabel('t-SNE Dimension 1')
+        # plt.ylabel('t-SNE Dimension 2')
+        # plt.grid(True)
+        # plt.savefig('tsne_states_reward.png', dpi=300, bbox_inches='tight')
+        # breakpoint()
 
 
     def select(self, select_fn):
@@ -195,16 +224,17 @@ class TreePolicy:
         return BatchedNode(selected_nodes)
             
     
-    def expand(self, nodes, use_gradient=True):
+    def expand(self, nodes, use_gradient=False, jump=None):
         """
         확장 단계: BatchedNode인 nodes의 각 노드(state)를 바탕으로 자식 노드들을 생성합니다.
         여기서는 각 노드가 pipeline.duplicate 만큼의 자식을 갖는다고 가정합니다.
         t와 latents는 현재 timestep과 latent 정보를 의미합니다.
         """
         # nodes.states: (B, C, H, W)
+        step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
         grad_mode = torch.enable_grad() if use_gradient else torch.no_grad()
         with grad_mode:
-            latent = nodes.states
+            latent = nodes.states.detach().to(torch.float32)
             if use_gradient:
                 latent.requires_grad_(True)
             if self.do_classifier_free_guidance:
@@ -230,21 +260,28 @@ class TreePolicy:
             # ddim_step_KL_modified: 노드의 상태에서 새로운 latent 후보들을 생성
             # new_latents: (B * duplicate, C, H, W)
             duplicate = self.pipeline.duplicate
-            new_latents, pred_original_sample, variance_coeff, _, _ = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
+            
+            if jump is not None:
+                jump_step = nodes.timesteps / 2
+            else:
+                jump_step = None
+            
+            new_latents, jump_latents, pred_original_sample, variance_coeff, jump_variance_coeff, _, _ = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
                 self.pipeline.scheduler,
                 noise_pred,    # 예측된 노이즈
                 old_noise_pred,
                 nodes.timesteps,
-                nodes.states,
+                latent,
                 eta=self.eta,
-                duplicate=duplicate
+                duplicate=duplicate,
+                jump_step=jump_step,
             ) # (B * duplicate, C, H, W)
+            
             new_latents = new_latents.view(self.pipeline.batch_size, duplicate, *new_latents.shape[1:])
             
             if use_gradient:
                 image = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / 0.18215)[0]
                 im_pix = ((image / 2) + 0.5).clamp(0, 1) 
-                
                 
                 if self.pipeline.reward == 'compressibility':
                     resize = torchvision.transforms.Resize(512, antialias=False)
@@ -252,7 +289,7 @@ class TreePolicy:
                     resize = torchvision.transforms.Resize(224, antialias=False)
                 else:
                     raise ValueError('Invalid reward type')
-                    
+                
                 im_pix = resize(im_pix)
                 normalize = torchvision.transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
                 im_pix = normalize(im_pix).to(image.dtype)
@@ -264,17 +301,28 @@ class TreePolicy:
                         evaluation, _ = self.pipeline.scorer(nodes.states, timesteps=nodes.timesteps) ### TODO timestep!!! 
                     else:
                         evaluation, _ = self.pipeline.scorer(im_pix, timesteps=nodes.timesteps)
+                evaluation = evaluation.to(torch.float32)
                 evaluation = self.lookforward_fn(evaluation).to(torch.float32)
                 guidance = torch.autograd.grad(outputs=evaluation, inputs=latent, grad_outputs=torch.ones_like(evaluation))[0].detach()
-
-                new_latents = new_latents + variance_coeff * guidance
+                if torch.isnan(guidance).any():
+                    guidance = torch.nan_to_num(guidance)
+                    
                 
+                min_scale = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - nodes.timesteps) // step_offset) + 1) - 1, 1.)] * nodes.timesteps.shape[0], device=self.device)
+                min_scale_next = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - nodes.timesteps) // step_offset) + 2) - 1, 1.)] * nodes.timesteps.shape[0], device=self.device)
+                
+                new_latents = new_latents + variance_coeff * guidance * min_scale_next.view(-1, 1, 1, 1)
+                if jump is not None:
+                    jump_latents = jump_latents + jump_variance_coeff * guidance * min_scale.view(-1, 1, 1, 1)
+                    jump_timesteps = torch.clamp(nodes.timesteps - jump_step, min=0)
+                else:
+                    jump_latents = [None] * duplicate
+                    jump_timesteps = None
 
-            step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
             new_timesteps = nodes.timesteps - step_offset
             mask = new_timesteps >= 0
             new_timesteps = torch.where(
-                mask, 
+                mask,
                 new_timesteps, 
                 torch.zeros_like(new_timesteps, device=new_timesteps.device) 
             ).repeat_interleave(duplicate).view(self.pipeline.batch_size, duplicate)
@@ -282,59 +330,49 @@ class TreePolicy:
             # 각 배치별로 자식 노드 리스트 생성: 각 부모는 duplicate 개의 자식을 가짐.
             nodes.add_children(new_latents, new_timesteps)
             # 평가(evaluate) 단계: 각 부모의 자식들에 대해 reward 계산 
-            for nodes in tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=3):
-                self.evaluate(BatchedNode(nodes))
+            for idx, nodes in enumerate(tqdm(list(zip(*nodes.get_novel_children())), desc='Evaluating', leave=False, position=3)):
+                self.evaluate(BatchedNode(nodes), jump_latents[idx], jump_timesteps)
                 self.backpropagate(nodes)
     
     @torch.no_grad()
-    def evaluate(self, batched_nodes):
+    def evaluate(self, batched_nodes, jump_latents=None, jump_timesteps=None):
+        if (jump_latents == None) and (jump_timesteps is None):
+            states = batched_nodes.states
+            timesteps = batched_nodes.timesteps
+        elif (jump_latents is not None) and (jump_timesteps is not None):
+            states = jump_latents.unsqueeze(0)
+            timesteps = jump_timesteps
+        else:
+            raise ValueError("Both jump_latents and jump_timesteps should be None or both should be not None.")
+        
+        latent_model_input = torch.cat([states] * 2) 
+        latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, timesteps)
+        noise_pred = self.pipeline.unet(
+            latent_model_input, 
+            timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else timesteps, 
+            encoder_hidden_states= self.prompt_embeds, 
+            cross_attention_kwargs=self.cross_attention_kwargs
+        ).sample    
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        new_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) 
+        pred_original_sample = predict_x0_from_xt_MCTS(
+                            self.pipeline.scheduler,
+                            new_noise_pred,   
+                            timesteps,
+                            states
+        )
         if  self.pipeline.variant == 'PM' and self.pipeline.reward == 'compressibility':
-            latent_model_input = torch.cat([batched_nodes.states] * 2) 
-            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, batched_nodes.timesteps)
-            noise_pred = self.pipeline.unet(
-                latent_model_input, 
-                batched_nodes.timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else batched_nodes.timesteps, 
-                encoder_hidden_states= self.prompt_embeds, 
-                cross_attention_kwargs=self.cross_attention_kwargs
-            ).sample                       
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            new_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) 
-            
-            pred_original_sample = predict_x0_from_xt_MCTS(
-                                self.pipeline.scheduler,
-                                new_noise_pred,   
-                                batched_nodes.timesteps,
-                                batched_nodes.states
-            )
-            
             images = self.pipeline.decode_latents(pred_original_sample)
             images = (images * 255).round().astype("uint8")
             evaluation = self.pipeline.scorer(images)
             batched_nodes.rewards = evaluation
             return evaluation     
 
-        ## Calculate E[x_0|x_t]
         if self.pipeline.variant == 'PM':
-            latent_model_input = torch.cat([batched_nodes.states] * 2) 
-            latent_model_input = self.pipeline.scheduler.scale_model_input(latent_model_input, batched_nodes.timesteps)
-            noise_pred = self.pipeline.unet(
-                latent_model_input, 
-                batched_nodes.timesteps.repeat_interleave(2) if self.do_classifier_free_guidance else batched_nodes.timesteps, 
-                encoder_hidden_states= self.prompt_embeds, 
-                cross_attention_kwargs=self.cross_attention_kwargs
-            ).sample             
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            new_noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond) 
-            pred_original_sample = predict_x0_from_xt_MCTS(
-                                self.pipeline.scheduler,
-                                new_noise_pred,   
-                                batched_nodes.timesteps,
-                                batched_nodes.states
-            )
             im_pix_un = self.pipeline.vae.decode(pred_original_sample.to(self.pipeline.vae.dtype) / 0.18215).sample
 
         elif self.pipeline.variant == 'MC':
-            im_pix_un = self.pipeline.vae.decode(batched_nodes.states.to(self.pipeline.vae.dtype) / 0.18215).sample
+            im_pix_un = self.pipeline.vae.decode(states.to(self.pipeline.vae.dtype) / 0.18215).sample
             
         im_pix = ((im_pix_un / 2) + 0.5).clamp(0, 1) 
 
@@ -355,9 +393,9 @@ class TreePolicy:
             evaluation, _ = self.pipeline.scorer(im_pix)
         elif self.pipeline.variant == 'MC':
             if self.pipeline.reward == 'compressibility':
-                evaluation, _ = self.pipeline.scorer(batched_nodes.states, timesteps=batched_nodes.timesteps) ### TODO timestep!!! 
+                evaluation, _ = self.pipeline.scorer(states, timesteps=timesteps) ### TODO timestep!!! 
             else:
-                evaluation, _ = self.pipeline.scorer(im_pix, timesteps=batched_nodes.timesteps)
+                evaluation, _ = self.pipeline.scorer(im_pix, timesteps=timesteps)
         batched_nodes.rewards = evaluation
         return evaluation
         
@@ -406,10 +444,6 @@ class TreePolicy:
         # GPU 메모리 비우기
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            
-    def _calc_guidance(self, calculated_reward, image, alpha=0.05):
-        guidance = torch.autograd.grad(outputs=calculated_reward, inputs=image, grad_outputs=torch.ones_like(calculated_reward))[0]
-        return guidance
     
     def get_final_latent(self):
         return self.root_nodes.states
