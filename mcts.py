@@ -232,6 +232,11 @@ class TreePolicy:
         """
         # nodes.states: (B, C, H, W)
         step_offset = self.pipeline.scheduler.config.num_train_timesteps // self.pipeline.scheduler.num_inference_steps
+        duplicate = self.pipeline.duplicate
+        jump_step = None
+        jump_latents = [None] * duplicate
+        jump_timesteps = None
+        
         grad_mode = torch.enable_grad() if use_gradient else torch.no_grad()
         with grad_mode:
             latent = nodes.states.detach().to(torch.float32)
@@ -259,13 +264,11 @@ class TreePolicy:
                 
             # ddim_step_KL_modified: 노드의 상태에서 새로운 latent 후보들을 생성
             # new_latents: (B * duplicate, C, H, W)
-            duplicate = self.pipeline.duplicate
             
             if jump is not None:
                 jump_step = nodes.timesteps / 2
-            else:
-                jump_step = None
-            
+                jump_timesteps = torch.clamp(nodes.timesteps - jump_step, min=0)
+
             new_latents, jump_latents, pred_original_sample, variance_coeff, jump_variance_coeff, _, _ = ddim_step_KL_MCTS( ## TODO 입력 noise_pred 확인
                 self.pipeline.scheduler,
                 noise_pred,    # 예측된 노이즈
@@ -305,7 +308,8 @@ class TreePolicy:
                 evaluation = self.lookforward_fn(evaluation).to(torch.float32)
                 guidance = torch.autograd.grad(outputs=evaluation, inputs=latent, grad_outputs=torch.ones_like(evaluation))[0].detach()
                 if torch.isnan(guidance).any():
-                    guidance = torch.nan_to_num(guidance)
+                    guidance = torch.nan_to_num(guidance, nan=0)
+                    evaluation = torch.nan_to_num(evaluation, nan=-1e6)
                     
                 
                 min_scale = torch.tensor([min((1 + self.tempering_gamma) ** (((self.pipeline.scheduler.timesteps[0] - nodes.timesteps) // step_offset) + 1) - 1, 1.)] * nodes.timesteps.shape[0], device=self.device)
@@ -314,10 +318,7 @@ class TreePolicy:
                 new_latents = new_latents + variance_coeff * guidance * min_scale_next.view(-1, 1, 1, 1)
                 if jump is not None:
                     jump_latents = jump_latents + jump_variance_coeff * guidance * min_scale.view(-1, 1, 1, 1)
-                    jump_timesteps = torch.clamp(nodes.timesteps - jump_step, min=0)
-                else:
-                    jump_latents = [None] * duplicate
-                    jump_timesteps = None
+                    
 
             new_timesteps = nodes.timesteps - step_offset
             mask = new_timesteps >= 0
